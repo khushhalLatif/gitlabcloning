@@ -1,16 +1,16 @@
 """
-GitLab Group Cloner
-====================
-Reads config.json in the same folder:
-
+GitLab Group Cloner — Method 1 (requests + subprocess)
+========================================================
+Reads config.json:
 {
     "gitlab_url": "https://gitlab.onefiserv.net",
     "access_token": "WDyreSgKjMTZt2Zomih7",
-    "group_path": "na/gfs/prepaid/moneynetwork/mn-2.0"
+    "group_path": "na/gfs/prepaid/moneynetwork/mn-2.0",
+    "output_zip": "gitlab_repos.zip"   <-- optional
 }
 
 Usage:
-    pip install python-gitlab
+    pip install requests
     python gitlab_clone_to_zip.py
 """
 
@@ -20,7 +20,7 @@ import shutil
 import subprocess
 import zipfile
 
-import gitlab
+import requests
 
 
 # ─────────────────────────────────────────────
@@ -29,102 +29,126 @@ import gitlab
 with open("config.json") as f:
     config = json.load(f)
 
-GITLAB_URL   = config["gitlab_url"]
+GITLAB_URL   = config["gitlab_url"].rstrip("/")
 ACCESS_TOKEN = config["access_token"]
 GROUP_PATH   = config["group_path"]
 OUTPUT_ZIP   = config.get("output_zip", "gitlab_repos.zip")
-TMP_DIR      = "_clone_tmp"
+
+# Short temp path to avoid Windows 260-char MAX_PATH limit
+TMP_DIR = "C:/tmp/gl_clone"
+
+HEADERS = {"PRIVATE-TOKEN": ACCESS_TOKEN}
 
 
 # ─────────────────────────────────────────────
-# Connect to GitLab
+# Fetch all projects via REST API (paginated)
 # ─────────────────────────────────────────────
-print(f"\n🔗  Connecting to {GITLAB_URL} ...")
-gl = gitlab.Gitlab(
-    url=GITLAB_URL,
-    private_token=ACCESS_TOKEN
-)
-gl.auth()
-print(f"✔   Authenticated successfully.\n")
+def get_all_projects():
+    encoded = GROUP_PATH.replace("/", "%2F")
+    url = f"{GITLAB_URL}/api/v4/groups/{encoded}/projects"
+    params = {
+        "include_subgroups": "true",
+        "per_page": 100,
+        "page": 1,
+        "archived": "false",
+    }
+    projects = []
+    print(f"📡  Fetching projects under: {GROUP_PATH}")
+    while True:
+        resp = requests.get(url, headers=HEADERS, params=params, timeout=30, verify=False)
+        resp.raise_for_status()
+        page = resp.json()
+        if not page:
+            break
+        projects.extend(page)
+        print(f"   Page {params['page']}: {len(page)} project(s) fetched...")
+        next_page = resp.headers.get("x-next-page", "")
+        if not next_page:
+            break
+        params["page"] = int(next_page)
+    return projects
 
 
 # ─────────────────────────────────────────────
-# Fetch all projects in the group (+ subgroups)
+# Clone a single repo
 # ─────────────────────────────────────────────
-print(f"📡  Fetching projects under: {GROUP_PATH}")
-group = gl.groups.get(GROUP_PATH)
-
-projects = group.projects.list(
-    include_subgroups=True,
-    all=True
-)
-print(f"✔   Found {len(projects)} project(s).\n")
-
-
-# ─────────────────────────────────────────────
-# Clone each project
-# ─────────────────────────────────────────────
-if os.path.exists(TMP_DIR):
-    shutil.rmtree(TMP_DIR)
-os.makedirs(TMP_DIR)
-
-success, failed = 0, []
-
-for i, proj in enumerate(projects, 1):
-    clone_url_auth = proj.http_url_to_repo.replace(
-        "https://", f"https://oauth2:{ACCESS_TOKEN}@"
-    )
-
-    # Preserve nested structure:  na/gfs/project  →  na/gfs/project/
-    folder_name = proj.path_with_namespace  # keep slashes = real subfolders
-    dest = os.path.join(TMP_DIR, folder_name)
-    os.makedirs(os.path.dirname(dest), exist_ok=True)  # create parent dirs
-
-    print(f"[{i}/{len(projects)}] Cloning: {proj.path_with_namespace}")
-
+def clone_repo(http_url: str, dest: str) -> bool:
+    # Inject token into URL for auth
+    auth_url = http_url.replace("https://", f"https://oauth2:{ACCESS_TOKEN}@")
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
     result = subprocess.run(
-        ["git", "clone", "--depth", "1", clone_url_auth, dest],
+        [
+            "git",
+            "-c", "core.longpaths=true",
+            "clone",
+            "--depth", "1",
+            auth_url,
+            dest
+        ],
         capture_output=True,
         text=True
     )
-
-    if result.returncode == 0:
-        print(f"           ✔ Done")
-        success += 1
-    else:
-        err = result.stderr.strip().splitlines()[-1] if result.stderr else "unknown error"
-        print(f"           ⚠ Failed: {err}")
-        failed.append(proj.path_with_namespace)
+    if result.returncode != 0:
+        err = result.stderr.strip().splitlines()[-1] if result.stderr else "unknown"
+        print(f"           ⚠  {err}")
+        return False
+    return True
 
 
 # ─────────────────────────────────────────────
-# Zip everything
+# Main
 # ─────────────────────────────────────────────
-print(f"\n📦  Creating zip: {OUTPUT_ZIP} ...")
+def main():
+    # 1. Fetch project list
+    projects = get_all_projects()
+    if not projects:
+        print("⚠  No projects found.")
+        return
+    print(f"✔   Found {len(projects)} project(s).\n")
 
-with zipfile.ZipFile(OUTPUT_ZIP, "w", zipfile.ZIP_DEFLATED) as zf:
-    for root, _dirs, files in os.walk(TMP_DIR):
-        for file in files:
-            full_path = os.path.join(root, file)
-            arcname   = os.path.relpath(full_path, TMP_DIR)
-            zf.write(full_path, arcname)
+    # 2. Clone
+    if os.path.exists(TMP_DIR):
+        shutil.rmtree(TMP_DIR)
+    os.makedirs(TMP_DIR)
 
-size_mb = os.path.getsize(OUTPUT_ZIP) / (1024 * 1024)
-print(f"✅  Zip created: {OUTPUT_ZIP}  ({size_mb:.2f} MB)")
+    success, failed = 0, []
 
-shutil.rmtree(TMP_DIR)
+    for i, proj in enumerate(projects, 1):
+        namespace = proj["path_with_namespace"]   # e.g. na/gfs/prepaid/.../repo
+        dest = os.path.join(TMP_DIR, namespace)
+        print(f"[{i}/{len(projects)}] Cloning: {namespace}")
+        if clone_repo(proj["http_url_to_repo"], dest):
+            print(f"           ✔ Done")
+            success += 1
+        else:
+            failed.append(namespace)
+
+    # 3. Zip
+    print(f"\n📦  Creating zip: {OUTPUT_ZIP} ...")
+    with zipfile.ZipFile(OUTPUT_ZIP, "w", zipfile.ZIP_DEFLATED) as zf:
+        for root, _dirs, files in os.walk(TMP_DIR):
+            for file in files:
+                full_path = os.path.join(root, file)
+                arcname = os.path.relpath(full_path, TMP_DIR)
+                zf.write(full_path, arcname)
+
+    size_mb = os.path.getsize(OUTPUT_ZIP) / (1024 * 1024)
+    print(f"✅  Zip created: {OUTPUT_ZIP}  ({size_mb:.2f} MB)")
+
+    # 4. Cleanup
+    shutil.rmtree(TMP_DIR)
+
+    # 5. Summary
+    print(f"\n{'─'*50}")
+    print(f"  Total   : {len(projects)}")
+    print(f"  Success : {success}")
+    print(f"  Failed  : {len(failed)}")
+    if failed:
+        for r in failed:
+            print(f"    - {r}")
+    print(f"  Output  : {os.path.abspath(OUTPUT_ZIP)}")
+    print(f"{'─'*50}\n")
 
 
-# ─────────────────────────────────────────────
-# Summary
-# ─────────────────────────────────────────────
-print(f"\n{'─'*50}")
-print(f"  Total projects  : {len(projects)}")
-print(f"  Cloned OK       : {success}")
-print(f"  Failed          : {len(failed)}")
-if failed:
-    print("  Failed repos:")
-    for r in failed:
-        print(f"    - {r}")
-print(f"  Output          : {os.path.abspath(OUTPUT_ZIP)}")
-print(f"{'─'*50}\n")
+if __name__ == "__main__":
+    main()
