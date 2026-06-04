@@ -75,9 +75,10 @@ for i, proj in enumerate(projects, 1):
         "https://", f"https://oauth2:{ACCESS_TOKEN}@"
     )
 
-    # Flatten path:  na/gfs/project  →  na__gfs__project
-    folder_name = proj.path_with_namespace.replace("/", "__")
+    # Preserve nested structure:  na/gfs/project  →  na/gfs/project/
+    folder_name = proj.path_with_namespace  # keep slashes = real subfolders
     dest = os.path.join(TMP_DIR, folder_name)
+    os.makedirs(os.path.dirname(dest), exist_ok=True)  # create parent dirs
 
     print(f"[{i}/{len(projects)}] Cloning: {proj.path_with_namespace}")
 
